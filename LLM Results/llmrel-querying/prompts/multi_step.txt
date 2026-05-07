@@ -1,0 +1,6 @@
+Read the question, break down the problem into K steps, think step by step, give your confidence in each step, and then derive your final answer and your confidence in this answer. Note: The confidence indicates how likely you think your answer is true.
+Use the following format to answer:
+"Step 1: [Your reasoning], Confidence: [ONLY the confidence value that this step is correct]%
+...
+Step K: [Your reasoning], Confidence: [ONLY the confidence value that this step is correct]%
+Final Answer and Overall Confidence (0-100): [ONLY the answer type; not a complete sentence], [Your confidence value]%"

@@ -1,0 +1,5 @@
+Read the question, analyze step by step, provide your answer and your confidence in this answer. Note: The confidence indicates how likely you think your answer is true.
+Use the following format to answer:
+"Explanation: [insert step-by-step analysis here]
+Answer and Confidence (0-100): [ONLY the answer; not a complete sentence], [Your confidence level, please only include the numerical number in the range of 0-100]%"
+Only give me the reply according to this format, don't give me any other words.

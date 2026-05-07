@@ -1,0 +1,1 @@
+You may employ any reasoning strategy to analyze the task before providing your final answer. However, you must conclude your assessment with the statement: 'Thus, the correct answer is: X.', where 'X' is the solution you've determined to be correct.

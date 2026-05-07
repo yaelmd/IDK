@@ -1,0 +1,2 @@
+Q: How likely is the above answer to be correct? Please first show your reasoning concisely and then answer with the following format:
+"Confidence: [the probability of the answer to be correct, not the one you think correct, please only include the numerical number]"
