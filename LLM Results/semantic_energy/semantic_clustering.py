@@ -122,7 +122,7 @@ def main():
     question_df = pd.DataFrame(data)
     question_df["id"] = question_df["id"].astype(int)
 
-    process_jsonl_files(f"./cache_data/{model}/{dataset}", n_responses, question_df,analyser,f"./cache_data/{model}/{dataset}/semantic_clusters.jsonl")
+    process_jsonl_files(f"./additional_data/{model}/{dataset}", n_responses, question_df,analyser,f"./additional_data/{model}/{dataset}/semantic_clusters.jsonl")
 
 
 if __name__ == "__main__":

@@ -136,7 +136,17 @@ def cal_boltzmann_logits(logits_list):
     Returns:
         List[float]: Transformed logits per item.
     """
-    return [-mean(sublist) for sublist in logits_list]
+    out = []
+    for seq in logits_list:
+        # keep only finite values
+        clean = [x for x in seq if np.isfinite(x)]
+
+        # fallback if everything is invalid
+        if len(clean) == 0:
+            out.append(0.0)
+        else:
+            out.append(-mean(clean))
+    return out
 
 
 def cal_flow(question_group, clusters, fermi_mu=None):
@@ -219,9 +229,9 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, trust_remote_code=True)
 
-    base_path = Path(f'./cache_data/{model_name}/{dataset_name}')
+    base_path = Path(f'./additional_data/{model_name}/{dataset_name}')
     dataset = load_jsonl(f"./datasets/{dataset_name}.jsonl")
-    cluster_data = load_jsonl(f'./cache_data/{model_name}/{dataset_name}/semantic_clusters.jsonl')
+    cluster_data = load_jsonl(f'./additional_data/{model_name}/{dataset_name}/semantic_clusters.jsonl')
 
     # ✅ FIX: map clusters by question_id so missing IDs are safe
     cluster_by_qid = {row["question_id"]: row["clusters"] for row in cluster_data}
@@ -256,7 +266,7 @@ def main():
     # ---- Load judgement files (.json) ----
     data_list = []
     for answer_idx in range(1, n_responses + 1):
-        path = f'./cache_data/{model_name}/{dataset_name}/judgement_{answer_idx}.json'
+        path = f'./additional_data/{model_name}/{dataset_name}/judgement_{answer_idx}.json'
         with open(path, 'r', encoding='utf-8') as f:
             data_list.append(json.load(f))
 

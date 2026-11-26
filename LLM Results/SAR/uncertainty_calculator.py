@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run additions dataset through a model and compute SAR uncertainty."
+        description="Run a dataset through a model and compute SAR uncertainty."
     )
     parser.add_argument(
         "--model-path",
@@ -48,7 +48,6 @@ def parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        help="Implemented tasks: addition, anagram, locality, gpqa, openbookqa",
     )
     return parser.parse_args()
 
@@ -103,7 +102,6 @@ def main():
 
     ini_time = time.time()
 
-    # ======= Load prompts from JSONL and build messages =======
     def load_questions(jsonl_path: Path):
         with jsonl_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -114,7 +112,6 @@ def main():
 
     records = list(load_questions(INPUT_JSONL))
 
-    # ======= Resume logic: skip already processed items =======
     processed_ids = set()
     if OUTPUT_JSONL.exists():
         with OUTPUT_JSONL.open("r", encoding="utf-8") as f:
@@ -193,27 +190,22 @@ def main():
                 logging.info(f"Successfully processed ID: {current_id}")
 
             except torch.cuda.OutOfMemoryError:
-                # 4. Handle OOM specifically: Clear everything and log the skip
                 logging.warning(f"OOM ERROR: Skipping ID {current_id}. This instance was too large for VRAM.")
                 
                 logging.info("oom-clean: del locals")
-                # Explicitly delete large objects to free references
                 if 'deps' in locals(): del deps
 
                 logging.info("oom-clean: del uncertainty_scores")
                 if 'uncertainty_scores' in locals(): del uncertainty_scores
 
             except Exception as e:
-                # 5. Handle any other unexpected errors
                 logging.error(f"UNEXPECTED ERROR on ID {current_id}: {str(e)}")
-                # logging.exception(f"UNEXPECTED ERROR on ID {current_id}")
                 if 'deps' in locals(): del deps
                 torch.cuda.empty_cache()
                 gc.collect()
             
             finally:
                 logging.info("Update index and continue to next batch.")
-                # CRITICAL: Always move the pointer forward, even if we failed!
                 rec_index += len(batch)
                 logging.info(f"--- Finished Instance {i+1}/{len(data_loader)} (ID: {current_id}) ---\n")
             

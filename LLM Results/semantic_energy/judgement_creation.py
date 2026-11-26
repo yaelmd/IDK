@@ -71,6 +71,8 @@ def correct_science_response(response, target):
     response = str(response).strip()
     response = re.sub(r'[, ]*\b\d{1,3}\s*%\s*$', '', response).strip()
 
+    # Extract the FIRST option letter in common MC formats:
+    #   "A", "(A)", "A.", "A)", "A -", "A: ...", "A An animal", "A. An animal"
     m = re.search(r'(?:^|[\s\(\[\{])([A-Z])(?:\s*[\.\,\)\]\}\:\-]|\s+|$)', response)
     if not m:
         return False
@@ -97,7 +99,9 @@ def create_judgment(dataset_name, response_data):
         labelling_method = correct_locality_response
     elif dataset_name == "openbookqa" or dataset_name == "gpqa":
         labelling_method = correct_science_response
-    elif dataset_name == "geometry" or dataset_name == "logic_puzzles":
+    elif dataset_name == "geometry" or dataset_name == "logic_puzzles" or \
+         dataset_name == "number_theory" or dataset_name == "algebra" or \
+         dataset_name == "arithmetic" or dataset_name == "combinatory":
         labelling_method = correct_omega_response
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -126,7 +130,7 @@ if __name__ == "__main__":
     model = args.model_path
 
     for i in range(1,n_responses+1):
-        input_path = f"./cache_data/{model}/{dataset_name}"
+        input_path = f"./additional_data/{model}/{dataset_name}"
         data = load_jsonl(f"{input_path}/response_{i}.jsonl")
         with open(f"{input_path}/judgement_{i}.json", "w") as f:
             json.dump(create_judgment(dataset_name,data), f, indent=4)

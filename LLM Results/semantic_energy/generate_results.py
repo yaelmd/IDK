@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
+# Generation settings (mirrors your snippet)
 MAX_NEW_TOKENS = 128
 TEMPERATURE = 1.0
 TOP_P = 1.0
@@ -102,7 +103,7 @@ def main():
     items = [Item(idx=i, question=row["question"], meta=row) for i, row in enumerate(rows, start=1)]
 
     # You looped over 1..7; keeping that behavior
-    for response in range(8, args.n_responses + 1):
+    for response in range(1, args.n_responses + 1):
         output_jsonl = f"./additional_data/{model_name}/{dataset}/response_{response}.jsonl"
         os.makedirs(os.path.dirname(output_jsonl), exist_ok=True)
 
@@ -110,7 +111,6 @@ def main():
             for it in items:
                 question = it.question  # assumes items = [Item(idx, question, meta), ...]
                 
-                # --- Your exact chat-template + generate flow (no batching) ---
                 messages = [
                     {"role": "user", "content": question}
                 ]
@@ -157,7 +157,6 @@ def main():
                 # Decode the generated text from the selected tokens
                 answer_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-                # Write out one JSONL record per item (same structure as before)
                 record = {
                     "question_id": it.idx,
                     "reasoning": "",
