@@ -33,6 +33,8 @@ import os
 import ast
 import glob
 import json
+import argparse
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -44,20 +46,27 @@ from xgboost import XGBClassifier
 
 
 # -----------------------
-# PATH CONFIG (edit these)
+# Default input paths (overridable through the CLI)
 # -----------------------
-DATASETS_ROOT = "Datasets"      # Datasets/<model>/<task>/<prompt>.csv
-EMBEDDINGS_ROOT = "Embeddings"
-TASK_DIFFICULTY_ROOT = "Difficulty"
-ADELE_CSV_PATH = "/idk-annotations_annotations_wide_cleaned_v1_science_updated.csv"
+SCRIPT_ROOT = Path(__file__).resolve().parent
+DATASETS_ROOT = str(SCRIPT_ROOT / "Datasets")
+EMBEDDINGS_ROOT = str(SCRIPT_ROOT / "Embeddings")
+TASK_DIFFICULTY_ROOT = str(SCRIPT_ROOT / "Difficulty")
+ADELE_CSV_PATH = str(SCRIPT_ROOT / "idk_annotations.csv")
+ANAGRAM_IDS_PATH = str(SCRIPT_ROOT / "ids_anagram.csv")
+DEFAULT_TASKS = ["geometry", "logic_puzzles", "algebra", "arithmetic",
+                 "combinatory", "number_theory", "addition", "locality",
+                 "anagram", "science"]
+DEFAULT_PROMPTS = ["CoT", "multi_step", "self_probing", "top_k", "vanilla"]
+CALIBRATED_TASKS = {"geometry", "logic_puzzles", "algebra", "arithmetic",
+                    "combinatory", "number_theory"}
+TASK_DIFFICULTY_COLUMNS = {"addition": "carry", "anagram": "letters",
+                           "locality": "city_frequency", "science": "difficulty"}
 
 
 RESULTS_ROOT = "assessor_results_ood"
 
 
-# -----------------------
-# Feature combos you want
-# -----------------------
 FEATURE_COMBOS = {
     "emb": ("emb",),
     "diff": ("diff",),
@@ -99,7 +108,7 @@ def load_embeddings_for_task(task: str) -> pd.DataFrame:
         raise ValueError(f"Embeddings file must have columns ['instance_id','embedding']: {path}")
     return df[["instance_id", "embedding"]].copy()
 
-def load_task_difficulty_for_task(task: str) -> pd.DataFrame:
+def load_task_difficulty_for_task(task: str, difficulty_type: str = "original") -> pd.DataFrame:
     path = os.path.join(TASK_DIFFICULTY_ROOT, f"{task}_difficulty.csv")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing task difficulty file for '{task}': {path}")
@@ -109,42 +118,76 @@ def load_task_difficulty_for_task(task: str) -> pd.DataFrame:
     if "instance_id" not in df.columns:
         raise ValueError(f"Task difficulty CSV must contain 'instance_id': {path}")
 
-    candidate_cols = [c for c in df.columns if c.lower() in ("difficulty")]
-    if not candidate_cols:
-        numeric_cols = [c for c in df.columns if c != "instance_id" and pd.api.types.is_numeric_dtype(df[c])]
-        if len(numeric_cols) != 1:
-            raise ValueError(
-                f"Could not uniquely determine difficulty column in {path}. "
-                f"Found numeric candidates: {numeric_cols}"
-            )
-        diff_col = numeric_cols[0]
+    if difficulty_type not in {"original", "calibrated"}:
+        raise ValueError(f"Unknown difficulty type: {difficulty_type}")
+    if difficulty_type == "calibrated" and (task in CALIBRATED_TASKS or "cal_diff" in df.columns):
+        diff_col = "cal_diff"
+    elif task in CALIBRATED_TASKS:
+        diff_col = "diff" if "diff" in df.columns else "difficulty"
     else:
-        diff_col = candidate_cols[0]
+        diff_col = TASK_DIFFICULTY_COLUMNS.get(task, "difficulty")
+    if diff_col not in df.columns:
+        raise ValueError(f"Missing {difficulty_type} difficulty column '{diff_col}' for '{task}': {path}")
 
     out = df[["instance_id", diff_col]].copy()
     out = out.rename(columns={diff_col: "task_difficulty"})
     out["task_difficulty"] = pd.to_numeric(out["task_difficulty"], errors="coerce")
+    out.attrs["difficulty_column"] = diff_col
+    out.attrs["difficulty_type"] = difficulty_type
     return out
 
 def load_adele_for_task(task: str, adele_df_all: pd.DataFrame) -> pd.DataFrame:
-    # Filter one big ADELE file by task
     required = {"benchmark", "instance_id"}
     if not required.issubset(set(adele_df_all.columns)):
         raise ValueError(f"ADELE CSV must contain columns {required}. Found: {list(adele_df_all.columns)}")
 
-    df = adele_df_all[adele_df_all["benchmark"].astype(str) == str(task)].copy()
+    if task == "science":
+        if "custom_id" not in adele_df_all.columns:
+            raise ValueError("Science ADELE annotations must contain 'custom_id'.")
+        science_ids = pd.read_csv(
+            embeddings_path_for_task(task), usecols=["instance_id", "ori_id"]
+        )
+        science_ids["custom_id"] = (
+            science_ids.pop("ori_id")
+            .str.replace("_", "-", regex=False)
+            .str.replace("obqa", "openbookqa", regex=False)
+        )
+        df = science_ids.merge(
+            adele_df_all.drop(columns=["instance_id"]),
+            on="custom_id", how="left", validate="one_to_one",
+        )
+        if df["benchmark"].isna().all():
+            raise ValueError("No science ADELE annotations matched the original IDs.")
+    else:
+        df = adele_df_all[adele_df_all["benchmark"].astype(str) == str(task)].copy()
 
-    # Keep instance_id + all numeric ADELE features (drop task)
+
     df = df.drop(columns=["benchmark", "custom_id"])
     if "instance_id" not in df.columns:
         raise ValueError("ADELE filtered df is missing instance_id unexpectedly.")
 
-    # Coerce all non-instance_id columns to numeric
     feature_cols = [c for c in df.columns if c != "instance_id"]
     for c in feature_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df 
+
+
+def exclude_ambiguous_anagrams(df: pd.DataFrame, task: str) -> pd.DataFrame:
+    if task != "anagram":
+        return df.copy()
+    flags = pd.read_csv(ANAGRAM_IDS_PATH)
+    excluded = flags.loc[flags["multiple_anagrams"].eq(1), "instance_id"]
+    return df.loc[~df["instance_id"].isin(excluded)].copy()
+
+
+def parse_embedding(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = ast.literal_eval(value)
+    return np.asarray(value, dtype=np.float32)
 
 
 def build_feature_matrix(
@@ -163,13 +206,16 @@ def build_feature_matrix(
     """
     merged = prompt_df.copy()
 
-    # Always require instance_id + outcome
+
     if "instance_id" not in merged.columns:
         raise ValueError("prompt_df must contain 'instance_id'")
     if "outcome" not in merged.columns:
         raise ValueError("prompt_df must contain 'outcome'")
 
-    # Merge requested families
+
+    merged = exclude_ambiguous_anagrams(merged, task)
+
+
     if "emb" in feature_families:
         if embeddings_df is None:
             raise ValueError("embeddings_df is required when using embeddings.")
@@ -192,7 +238,7 @@ def build_feature_matrix(
     if "emb" in feature_families:
         if merged["embedding"].isna().any():
             raise ValueError(f"Missing embeddings after merge for task '{task}'. Check instance_id alignment.")
-        X_emb = np.array(merged["embedding"].apply(ast.literal_eval).tolist(), dtype=np.float32)
+        X_emb = np.stack(merged["embedding"].apply(parse_embedding).tolist())
         blocks.append(X_emb)
 
     if "diff" in feature_families:
@@ -211,7 +257,7 @@ def build_feature_matrix(
         if len(adele_feature_cols) == 0:
             raise ValueError(f"No numeric ADELE features found for task '{task}'.")
 
-        X_adele = merged[adele_feature_cols].to_numpy(dtype=np.float32)
+        X_adele = merged[adele_feature_cols].to_numpy(dtype=np.float32, copy=True)
 
         if np.isnan(X_adele).any():
             col_means = np.nanmean(X_adele, axis=0)
@@ -309,7 +355,7 @@ def save_results(results_dict, save_dir='assessor_results'):
 
     # Results CSV
     df_path = os.path.join(save_dir, f"{base}_results.csv")
-    results_dict['results_df'].to_csv(df_path, index=False)
+    results_dict['results_df'].drop(columns=["embedding"], errors="ignore").to_csv(df_path, index=False)
 
     print(f"Saved for {prompt_type}:")
     print(f"  - Metrics: {metrics_path}")
@@ -351,7 +397,8 @@ def train_assessor_cv_from_X(
     y: np.ndarray,
     prompt_name: str,
     n_splits: int = 5,
-    random_state: int = 42
+    random_state: int = 42,
+    n_jobs: int | None = None,
 ):
     print(f"\n{'='*60}")
     print(f"TRAINING ASSESSOR FOR PROMPT: {prompt_name}")
@@ -398,8 +445,10 @@ def train_assessor_cv_from_X(
         K = len(fold_global_classes)
         if K == 3:
             model = XGBClassifier(
+                device="cpu",
                 objective="multi:softprob",
                 num_class=3,
+                n_jobs=n_jobs,
                 random_state=random_state,
                 n_estimators=300,
                 max_depth=6,
@@ -410,7 +459,9 @@ def train_assessor_cv_from_X(
             )
         elif K == 2:
             model = XGBClassifier(
+                device="cpu",
                 objective="binary:logistic",
+                n_jobs=n_jobs,
                 random_state=random_state,
                 n_estimators=300,
                 max_depth=6,
@@ -428,7 +479,8 @@ def train_assessor_cv_from_X(
         probs_full = np.zeros((len(test_idx), 3), dtype=np.float32)
         for col_idx, fold_local_class in enumerate(model.classes_):
             global_numeric = inv_fold_map[int(fold_local_class)]  # back to global numeric (0/1/2)
-            probs_full[:, global_numeric] = y_pred_proba[:, col_idx]
+            global_col = class_order.index(present_classes[global_numeric])
+            probs_full[:, global_col] = y_pred_proba[:, col_idx]
 
         all_test_predictions[test_idx] = probs_full
         all_test_labels[test_idx] = y_test_str
@@ -464,24 +516,64 @@ def list_models(datasets_root: str):
         if os.path.isdir(os.path.join(datasets_root, d))
     )
 
-def load_prompt_dfs_for_task(datasets_root: str, model: str, task: str) -> dict:
+def load_prompt_dfs_for_task(datasets_root: str, model: str, task: str, prompts_to_run=None) -> dict:
     task_dir = os.path.join(datasets_root, model, task)
     if not os.path.isdir(task_dir):
-        return {}
-    prompt_files = sorted(glob.glob(os.path.join(task_dir, "*.csv")))
+        raise FileNotFoundError(f"Missing task folder: {task_dir}")
+    prompt_names = DEFAULT_PROMPTS if prompts_to_run is None else prompts_to_run
+    if isinstance(prompt_names, str):
+        prompt_names = [prompt_names]
     out = {}
-    for fp in prompt_files:
-        prompt_name = os.path.splitext(os.path.basename(fp))[0]
+    for prompt_name in prompt_names:
+        fp = os.path.join(task_dir, f"{prompt_name}.csv")
+        if not os.path.isfile(fp):
+            raise FileNotFoundError(f"Missing requested prompt: {fp}")
         out[prompt_name] = pd.read_csv(fp)
     return out
+
+
+def save_training_log(runs, results_root, mode):
+    """Persist and print the successfully completed training runs."""
+    os.makedirs(results_root, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    log_path = os.path.join(results_root, f"{mode}_{timestamp}_training_log.json")
+    with open(log_path, "w") as f:
+        json.dump({"mode": mode, "completed_runs": runs}, f, indent=2)
+    print(f"\n{mode.upper()} complete: {len(runs)} assessor runs trained and saved.")
+    for run in runs:
+        print(
+            f"  Model={run['model']} | features={run['feature_combo']} | "
+            f"prompt={run['prompt']} | trained on={run['training_tasks']} | "
+            f"evaluated on={run['evaluation_tasks']}"
+        )
+    print(f"Training log: {log_path}")
 
 
 def run_assessors_for_tasks(
     tasks,
     feature_combo: str | list[str],
     n_splits: int = 5,
-    random_state: int = 42
+    random_state: int = 42,
+    model: str | list[str] | None = None,
+    models_to_run: str | list[str] | None = None,
+    prompts_to_run: str | list[str] | None = None,
+    results_root: str | None = None,
+    confidence_threshold: float = 90.0,
+    n_jobs: int | None = None,
+    difficulty_type: str = "original",
 ):
+    """Run IID task CV for selected models and prompt names (CSV stems).
+
+    Each filter accepts a name, a list of names, or None to select all.
+    The legacy model argument remains supported; use only one model filter.
+    """
+    if model is not None and models_to_run is not None:
+        raise ValueError("Use either model or models_to_run, not both.")
+    selected_models = models_to_run if models_to_run is not None else model
+    results_root = RESULTS_ROOT if results_root is None else results_root
+    if isinstance(prompts_to_run, str):
+        prompts_to_run = [prompts_to_run]
+
     if isinstance(tasks, str):
         tasks = [tasks]
 
@@ -500,12 +592,22 @@ def run_assessors_for_tasks(
     if not models:
         raise FileNotFoundError(f"No model folders found in: {DATASETS_ROOT}")
 
-    # Load ADELE once
-    adele_all = pd.read_csv(ADELE_CSV_PATH)
+    if selected_models is not None:
+        requested_models = [selected_models] if isinstance(selected_models, str) else list(selected_models)
+        unknown_models = sorted(set(requested_models) - set(models))
+        if unknown_models:
+            raise ValueError(f"Unknown models: {unknown_models}. Available: {models}")
+        models = [name for name in models if name in requested_models]
+
+    completed_runs = []
+
+
+    adele_all = pd.read_csv(ADELE_CSV_PATH) if any("adele" in FEATURE_COMBOS.get(c, ()) for c in combos) else None
 
     print("Models discovered:", models)
     print("Tasks requested:", tasks)
     print("Feature combos requested:", combos)
+    print("Prompt filter:", prompts_to_run)
 
     for combo_name in combos:
         if combo_name not in FEATURE_COMBOS:
@@ -523,27 +625,18 @@ def run_assessors_for_tasks(
 
             # Load only the sources needed for this combo
             embeddings_df = load_embeddings_for_task(task) if "emb" in families else None
-            difficulty_df = load_task_difficulty_for_task(task) if "diff" in families else None
+            difficulty_df = load_task_difficulty_for_task(task, difficulty_type) if "diff" in families else None
             adele_task_df = load_adele_for_task(task, adele_all) if "adele" in families else None
 
             for model in models:
                 task_dir = os.path.join(DATASETS_ROOT, model, task)
-                if not os.path.isdir(task_dir):
-                    print(f"[Skip] No task folder: {task_dir}")
-                    continue
+                prompt_dfs = load_prompt_dfs_for_task(DATASETS_ROOT, model, task, prompts_to_run)
 
-                prompt_dfs = load_prompt_dfs_for_task(DATASETS_ROOT, model, task)
-                if not prompt_dfs:
-                    print(f"[Skip] No prompt CSVs in: {task_dir}")
-                    continue
-
-                # Apply your avoidance-by-confidence
-                prompt_dfs = {name: apply_avoidance_by_confidence(df) for name, df in prompt_dfs.items()}
+                prompt_dfs = {name: apply_avoidance_by_confidence(df, threshold=confidence_threshold) for name, df in prompt_dfs.items()}
 
                 print(f"\n--- Model: {model} | prompts: {list(prompt_dfs.keys())} ---")
 
-                # Save dir grouped by feature combo
-                save_dir = os.path.join(RESULTS_ROOT, combo_name, task, model)
+                save_dir = os.path.join(results_root, combo_name, task, model)
                 os.makedirs(save_dir, exist_ok=True)
 
                 for prompt_name, df_prompt in prompt_dfs.items():
@@ -565,18 +658,34 @@ def run_assessors_for_tasks(
                             y=y,
                             prompt_name=prompt_name,
                             n_splits=n_splits,
-                            random_state=random_state
+                            random_state=random_state,
+                            n_jobs=n_jobs,
                         )
 
                         if res:
-                            save_results(res, save_dir=save_dir)
+                            metrics_path, results_path = save_results(res, save_dir=save_dir)
+                            completed_runs.append({
+                                "model": model,
+                                "feature_combo": combo_name,
+                                "prompt": prompt_name,
+                                "training_tasks": [task],
+                                "evaluation_tasks": [task],
+                                "data_size": res["data_size"],
+                                "n_splits": n_splits,
+                                "metrics_path": metrics_path,
+                                "results_path": results_path,
+                            })
                             print_detailed_metrics(res["metrics"])
                         else:
-                            print(f"[Skip] Not enough data / only one class for {combo_name}/{task}/{model}/{prompt_name}")
+                            raise RuntimeError(f"Could not train {combo_name}/{task}/{model}/{prompt_name}")
 
                     except Exception as e:
                         print(f"Failed assessor for {combo_name}/{task}/{model}/{prompt_name}: {e}")
-                        continue
+                        save_training_log(completed_runs, results_root, "cv")
+                        raise
+
+    save_training_log(completed_runs, results_root, "cv")
+    return completed_runs
 
 
 def train_assessor_ood_train_test(
@@ -587,7 +696,8 @@ def train_assessor_ood_train_test(
     X_test: np.ndarray,
     y_test: np.ndarray,
     prompt_name: str,
-    random_state: int = 42
+    random_state: int = 42,
+    n_jobs: int | None = None,
 ):
     print(f"\n{'='*60}")
     print(f"OOD TRAINING ASSESSOR FOR PROMPT: {prompt_name}")
@@ -625,8 +735,10 @@ def train_assessor_ood_train_test(
 
     if K == 3:
         model = XGBClassifier(
+            device="cpu",
             objective="multi:softprob",
             num_class=3,
+            n_jobs=n_jobs,
             random_state=random_state,
             n_estimators=300,
             max_depth=6,
@@ -637,7 +749,9 @@ def train_assessor_ood_train_test(
         )
     elif K == 2:
         model = XGBClassifier(
+            device="cpu",
             objective="binary:logistic",
+            n_jobs=n_jobs,
             random_state=random_state,
             n_estimators=300,
             max_depth=6,
@@ -704,7 +818,7 @@ def save_ood_results(results_dict, save_dir='assessor_results_ood'):
         json.dump(results_dict['metrics'], f, indent=2)
 
     df_path = os.path.join(save_dir, f"{base}_results.csv")
-    results_dict['results_df'].to_csv(df_path, index=False)
+    results_dict['results_df'].drop(columns=["embedding"], errors="ignore").to_csv(df_path, index=False)
 
     print(f"Saved OOD for {prompt_type}:")
     print(f"  - Metrics: {metrics_path}")
@@ -722,7 +836,10 @@ def run_assessors_leave_one_task_out(
     models_to_run=None,
     prompts_to_run=None,
     random_state: int = 42,
-    results_root: str = "assessor_results_ood"
+    results_root: str = "assessor_results_ood",
+    confidence_threshold: float = 90.0,
+    n_jobs: int | None = None,
+    difficulty_type: str = "calibrated",
 ):
     if isinstance(all_tasks, str):
         all_tasks = [all_tasks]
@@ -749,11 +866,16 @@ def run_assessors_leave_one_task_out(
     if models_to_run is not None:
         if isinstance(models_to_run, str):
             models_to_run = [models_to_run]
+        unknown_models = sorted(set(models_to_run) - set(models))
+        if unknown_models:
+            raise ValueError(f"Unknown models: {unknown_models}. Available: {models}")
         models = [m for m in models if m in models_to_run]
 
-    adele_all = pd.read_csv(ADELE_CSV_PATH)
+    adele_all = pd.read_csv(ADELE_CSV_PATH) if any("adele" in FEATURE_COMBOS.get(c, ()) for c in combos) else None
 
     print("Models discovered:", models)
+    completed_runs = []
+
     print("All tasks:", all_tasks)
     print("Held-out tasks to run now:", tasks_to_run)
     print("Feature combos requested:", combos)
@@ -779,17 +901,14 @@ def run_assessors_leave_one_task_out(
                 if "emb" in families:
                     embeddings_by_task[task] = load_embeddings_for_task(task)
                 if "diff" in families:
-                    difficulty_by_task[task] = load_task_difficulty_for_task(task)
+                    difficulty_by_task[task] = load_task_difficulty_for_task(task, difficulty_type)
                 if "adele" in families:
                     adele_by_task[task] = load_adele_for_task(task, adele_all)
 
             for model in models:
                 print(f"\n--- Model: {model} ---")
 
-                held_out_prompt_dfs = load_prompt_dfs_for_task(DATASETS_ROOT, model, held_out_task)
-                if not held_out_prompt_dfs:
-                    print(f"[Skip] No prompt CSVs for held-out task folder: {os.path.join(DATASETS_ROOT, model, held_out_task)}")
-                    continue
+                held_out_prompt_dfs = load_prompt_dfs_for_task(DATASETS_ROOT, model, held_out_task, prompts_to_run)
 
                 prompt_names = sorted(held_out_prompt_dfs.keys())
 
@@ -817,13 +936,9 @@ def run_assessors_leave_one_task_out(
                         train_y_parts = []
 
                         for train_task in train_tasks:
-                            task_prompt_dfs = load_prompt_dfs_for_task(DATASETS_ROOT, model, train_task)
+                            task_prompt_dfs = load_prompt_dfs_for_task(DATASETS_ROOT, model, train_task, [prompt_name])
 
-                            if prompt_name not in task_prompt_dfs:
-                                print(f"[Skip train task] Missing prompt '{prompt_name}' in {model}/{train_task}")
-                                continue
-
-                            df_prompt = apply_avoidance_by_confidence(task_prompt_dfs[prompt_name])
+                            df_prompt = apply_avoidance_by_confidence(task_prompt_dfs[prompt_name], threshold=confidence_threshold)
 
                             X_part, y_part, merged_part = build_feature_matrix(
                                 prompt_df=df_prompt,
@@ -842,8 +957,7 @@ def run_assessors_leave_one_task_out(
                             train_y_parts.append(y_part)
 
                         if len(train_X_parts) == 0:
-                            print(f"[Skip] No training data for prompt '{prompt_name}' with held-out task '{held_out_task}'")
-                            continue
+                            raise ValueError(f"No training data for prompt '{prompt_name}' with held-out task '{held_out_task}'")
 
                         train_merged_df = pd.concat(train_merged_parts, ignore_index=True)
                         X_train = np.concatenate(train_X_parts, axis=0).astype(np.float32)
@@ -852,7 +966,7 @@ def run_assessors_leave_one_task_out(
                         # -----------------------
                         # TEST set
                         # -----------------------
-                        df_test_prompt = apply_avoidance_by_confidence(held_out_prompt_dfs[prompt_name])
+                        df_test_prompt = apply_avoidance_by_confidence(held_out_prompt_dfs[prompt_name], threshold=confidence_threshold)
 
                         X_test, y_test, test_merged_df = build_feature_matrix(
                             prompt_df=df_test_prompt,
@@ -877,30 +991,91 @@ def run_assessors_leave_one_task_out(
                             X_test=X_test,
                             y_test=y_test,
                             prompt_name=prompt_name,
-                            random_state=random_state
+                            random_state=random_state,
+                            n_jobs=n_jobs,
                         )
 
                         if res:
-                            save_ood_results(res, save_dir=save_dir)
+                            metrics_path, results_path = save_ood_results(res, save_dir=save_dir)
+                            completed_runs.append({
+                                "model": model,
+                                "feature_combo": combo_name,
+                                "prompt": prompt_name,
+                                "training_tasks": train_merged_df["source_task"].drop_duplicates().tolist(),
+                                "training_rows_by_task": {
+                                    task: int(count) for task, count in
+                                    train_merged_df["source_task"].value_counts().items()
+                                },
+                                "evaluation_tasks": [held_out_task],
+                                "train_size": res["train_size"],
+                                "test_size": res["test_size"],
+                                "metrics_path": metrics_path,
+                                "results_path": results_path,
+                            })
                             print_detailed_metrics(res["metrics"])
                         else:
-                            print(f"[Skip] Could not train OOD assessor for {combo_name} | leave_out={held_out_task} | {model} | {prompt_name}")
+                            raise RuntimeError(f"Could not train OOD {combo_name}/{held_out_task}/{model}/{prompt_name}")
 
                     except Exception as e:
                         print(f"Failed OOD assessor for {combo_name} | leave_out={held_out_task} | {model} | {prompt_name}: {e}")
-                        continue
+                        save_training_log(completed_runs, results_root, "ood")
+                        raise
+
+    save_training_log(completed_runs, results_root, "ood")
+    return completed_runs
+
+
+
+def build_argument_parser():
+    parser = argparse.ArgumentParser(description="Train IID or OOD assessors.")
+    parser.add_argument("--mode", choices=["ood", "iid"], required=True)
+    parser.add_argument("--models", nargs="+", default=["all"], help="Exact model folder names, or all (default).")
+    parser.add_argument("--all-tasks", nargs="+", choices=DEFAULT_TASKS, default=DEFAULT_TASKS,
+                        help="Task universe for leave-one-task-out training.")
+    parser.add_argument("--tasks", nargs="+", choices=DEFAULT_TASKS,
+                        help="Held-out tasks for OOD; evaluated tasks for IID. Defaults to all tasks.")
+    parser.add_argument("--prompts", nargs="+", choices=DEFAULT_PROMPTS, default=DEFAULT_PROMPTS)
+    parser.add_argument("--feature-combos", nargs="+", default=["all"], help="all, or emb/diff/adele combinations.")
+    parser.add_argument("--n-splits", type=int, default=5, help="Number of IID CV folds.")
+    parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--n-jobs", type=int, help="CPU threads per XGBoost fit; set explicitly for parallel processes.")
+    parser.add_argument("--confidence-threshold", type=float, default=90.0)
+    parser.add_argument("--results-root", type=Path, required=True, help="Output directory.")
+    parser.add_argument("--datasets-root", default=DATASETS_ROOT)
+    parser.add_argument("--embeddings-root", default=EMBEDDINGS_ROOT)
+    parser.add_argument("--difficulty-root", default=TASK_DIFFICULTY_ROOT)
+    parser.add_argument("--difficulty-type", choices=["original", "calibrated"],
+                        help="Defaults to calibrated for OOD and original for IID; selects cal_diff where supplied.")
+    parser.add_argument("--adele-csv", default=ADELE_CSV_PATH)
+    parser.add_argument("--anagram-ids", default=ANAGRAM_IDS_PATH)
+    return parser
+
+
+def main(argv=None):
+    global DATASETS_ROOT, EMBEDDINGS_ROOT, TASK_DIFFICULTY_ROOT, ADELE_CSV_PATH, ANAGRAM_IDS_PATH
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    DATASETS_ROOT = args.datasets_root
+    EMBEDDINGS_ROOT = args.embeddings_root
+    TASK_DIFFICULTY_ROOT = args.difficulty_root
+    ADELE_CSV_PATH = args.adele_csv
+    ANAGRAM_IDS_PATH = args.anagram_ids
+    models = list_models(DATASETS_ROOT) if args.models == ["all"] else args.models
+    combos = list(FEATURE_COMBOS) if args.feature_combos == ["all"] else args.feature_combos
+    tasks = args.tasks if args.tasks is not None else args.all_tasks
+    difficulty_type = args.difficulty_type or ("calibrated" if args.mode == "ood" else "original")
+    common = dict(
+        feature_combo=combos, models_to_run=models, prompts_to_run=args.prompts,
+        random_state=args.random_state, results_root=str(args.results_root),
+        confidence_threshold=args.confidence_threshold, n_jobs=args.n_jobs,
+        difficulty_type=difficulty_type,
+    )
+    if args.mode == "ood":
+        run_assessors_leave_one_task_out(all_tasks=args.all_tasks, tasks_to_run=tasks, **common)
+    else:
+        run_assessors_for_tasks(tasks=tasks, n_splits=args.n_splits, **common)
+    return 0
+
 
 if __name__ == "__main__":
-    run_assessors_for_tasks(
-        ["addition","anagram","science","geometry","locality","logic_puzzles"], 
-        feature_combo=["emb+diff+adele"])
-
-    # OOD
-    run_assessors_leave_one_task_out(
-        all_tasks=["addition", "anagram", "science", "geometry", "locality", "logic_puzzles"],
-        tasks_to_run=["addition", "anagram", "science", "geometry", "locality", "logic_puzzles"],
-        models_to_run=None,
-        prompts_to_run=None,
-        feature_combo=["emb+diff+adele"],
-        results_root="assessor_results_ood"
-    )
+    raise SystemExit(main())
