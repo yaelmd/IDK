@@ -4,9 +4,11 @@ import os
 import string
 import pandas as pd
 
+TARGET_DICT = {"addition":"target","anagram":"word", "locality" : "target_city", "science": "correct_option",
+               "geometry": "answer", "logic_puzzles": "answer", "algebra":"answer", "arithmetic": "answer",
+               "combinatory": "answer", "number_theory": "answer"}
 
-TARGET_DICT = {"addition":"target","anagram":"word", "locality" : "target_city", "science":"correct_option",
-               "geometry": "answer", "logic_puzzles": "answer"}
+OMEGA_TASKS = ["geometry", "logic_puzzles", "algebra", "arithmetic", "combinatory", "number_theory"]
 
 
 def clean_response(prompt, response, model_type = None):
@@ -14,17 +16,19 @@ def clean_response(prompt, response, model_type = None):
     Generic method for initially cleaning every response. It removes the initial prompt and special tokens
     """
     if "llama" in model_type or "Qwen" in model_type:
+        
         if "llama" in model_type:
             ASSISTANT_HDR = r"<\|start_header_id\|>assistant<\|end_header_id\|>"
         if "Qwen" in model_type:
             ASSISTANT_HDR = r"<\|im_start\|>assistant"
         
+        # Normalize newlines
         response = response.replace("\r\n", "\n")
+
 
         m = re.search(ASSISTANT_HDR, response)
         if m:
             response = response[m.end():]
-
             stop = re.search(
                 r"<\|start_header_id\|>.*?<\|end_header_id\|>|<\|end_of_text\|>|<\|eot_id\|>",
                 response,
@@ -33,7 +37,7 @@ def clean_response(prompt, response, model_type = None):
             if stop:
                 response = response[:stop.start()]
 
-
+        # 2) Remove all special tokens like <|eot_id|>, <|end_of_text|>, etc.
         response = re.sub(r"<\|[^|]+?\|>", "", response)
 
         # Tidy up whitespace
@@ -64,7 +68,12 @@ def extract_numbers(response):
     """
     Auxiliar method to extract numbers from responses
     """
-    numbers = re.findall(r"\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", response)
+    # numbers = re.findall(r"\d+\.\d+|\d+", response)
+    # numbers = re.findall(r"\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", response)
+    return re.findall(
+        r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
+        response,
+    )
     return numbers
 
 def remove_punctuation(response: str) -> str:
@@ -278,7 +287,7 @@ def label_addition_response(response, target, confidence=None):
         numbers.remove(confidence) 
     if len(numbers) == 1:
         try:
-            if str(numbers[0]) == str(target):
+            if str(numbers[0]).rstrip(".") == str(target).rstrip("."):
                 return "CORRECT"
             else:
                 return "INCORRECT"
@@ -358,6 +367,8 @@ def label_science_response(response, target, correct_answer):
     response = str(response).strip()
     response = re.sub(r'[, ]*\b\d{1,3}\s*%\s*$', '', response).strip()
 
+    # Extract the FIRST option letter in common MC formats:
+    #   "A", "(A)", "A.", "A)", "A -", "A: ...", "A An animal", "A. An animal"
     m = re.search(r'(?:^|[\s\(\[\{])([A-Z])(?:\s*[\.\,\)\]\}\:\-]|\s+|$)', response)
     if not m:
         if response.lower() == correct_answer.strip().lower():
@@ -382,13 +393,21 @@ def label_omega_response(response, target, confidence=None, prompt_type=None):
     
     response = response.strip().lower()
 
+    if any(value in response for value in ("infinity", "infinite", r"\infty", "∞")):
+        return "INCORRECT"
+
     if "$" in response or "boxed" in response:
         boxed_answer = extract_dollar(response)
-        if str(boxed_answer) == str(target):
-            return "CORRECT"
-        elif boxed_answer is None:
-            return "AVOIDANCE"
-        else:
+        try:
+            if str(boxed_answer) == str(target):
+                return "CORRECT"
+            elif boxed_answer is None:
+                return "AVOIDANCE"
+            elif float(boxed_answer) == float(target):
+                return "CORRECT"
+            else:
+                return "INCORRECT"
+        except ValueError:
             return "INCORRECT"
         
     numbers = extract_numbers(response)
@@ -397,6 +416,8 @@ def label_omega_response(response, target, confidence=None, prompt_type=None):
     if len(numbers) == 1:
         try:
             if str(numbers[0]) == str(target):
+                return "CORRECT"
+            elif float(numbers[0]) == float(target):
                 return "CORRECT"
             else:
                 return "INCORRECT"
@@ -494,7 +515,13 @@ def convert_to_confidence(uncertainty:pd.Series, method: str) -> pd.Series:
     SAR = -8 (very uncertain), normalized: 15% , converted: 15% confidence
     SAR = 0 (very certain), normalized: 100%, converted: 100% confidence
     """
+    
+    # if method == "semantic_energy":
+    #     confidence = 100 - uncertainty
+    # else:
+    #     confidence = uncertainty
 
+    # return confidence
 
     return 100 - uncertainty
 
@@ -514,12 +541,14 @@ def save_csv(df: pd.DataFrame, file_path: str, **kwargs) -> None:
         Additional arguments passed to `DataFrame.to_csv()`
         (e.g., index=False, sep=';', etc.)
     """
-
+    # Extract folder path
     folder = os.path.dirname(file_path)
 
+    # Create the folder if it doesn't exist
     if folder and not os.path.exists(folder):
         os.makedirs(folder, exist_ok=True)
 
+    # Save the CSV file
     df.to_csv(file_path, **kwargs)
 
 
@@ -535,7 +564,7 @@ def label_outcome(response, target,  task, confidence=None, correct_answer=None,
         return label_locality_response(response, target, confidence)
     elif task == "science":
         return label_science_response(response, target, correct_answer)
-    elif task == "geometry" or task == "logic_puzzles":
+    elif task in OMEGA_TASKS:
         return label_omega_response(response, target, confidence, prompt_type)
     else:
         raise ValueError(f"{task} not implemented yet!")
@@ -576,6 +605,8 @@ def drop_confidence_none(outcome, confidence):
 def get_minimal_response(response: str, task: str) -> str:
 
     if task == "science":
+        # Extract the FIRST option letter in common MC formats:
+        #   "A", "(A)", "A.", "A)", "A -", "A: ...", "A An animal", "A. An animal"
         m = re.search(r'(?:^|[\s\(\[\{])([A-E])(?:\s*[\.\,\)\]\}\:\-]|\s+|$)', response)
         if not m:
             return response.strip()

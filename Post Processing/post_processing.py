@@ -6,7 +6,7 @@ import argparse
 BLACK_BOX_METHODS = ["vanilla","top_k","self_probing","multi_step","CoT","self_consistency","formatted"]
 WHITE_BOX_METHODS = ["SAR", "semantic_energy"]
 
-ASSESSOR_ANSWERABILITY_RISK = [
+ASSESSOR_KEXIN = [
     "asr_adele_CoT", "asr_adele_multi_step", "asr_adele_self_probing", "asr_adele_top_k", "asr_adele_vanilla",
     "asr_diff_CoT", "asr_diff_multi_step", "asr_diff_self_probing", "asr_diff_top_k", "asr_diff_vanilla",
     "asr_diff+adele_CoT", "asr_diff+adele_multi_step", "asr_diff+adele_self_probing", "asr_diff+adele_top_k", "asr_diff+adele_vanilla",
@@ -16,15 +16,16 @@ ASSESSOR_ANSWERABILITY_RISK = [
     "asr_emb+diff+adele_CoT", "asr_emb+diff+adele_multi_step", "asr_emb+diff+adele_self_probing", "asr_emb+diff+adele_top_k", "asr_emb+diff+adele_vanilla",
 ]
 
-ASSESSOR_ERROR_RISK = ["asr_difficulty+embedding", "asr_difficulty", "asr_embedding", "asr_demands",
+ASSESSOR_ALVARO = ["asr_difficulty+embedding", "asr_difficulty", "asr_embedding", "asr_demands",
                     "asr_difficulty+demands", "asr_difficulty+embedding+demands", "asr_embedding+demands"]
 
 
-ASSESSOR_METHODS = ASSESSOR_ERROR_RISK + ASSESSOR_ANSWERABILITY_RISK
+ASSESSOR_METHODS = ASSESSOR_ALVARO + ASSESSOR_KEXIN
 
 TARGET_DICT = {"addition":"target","anagram":"word", "locality" : "target_city", "science": "correct_option",
-               "geometry": "answer", "logic_puzzles": "answer"}
-BLACK_BOX_MODELS = ["GPT5.2","gemini-3-pro-preview"]
+               "geometry": "answer", "logic_puzzles": "answer", "algebra":"answer", "arithmetic": "answer",
+               "combinatory": "answer", "number_theory": "answer"}
+BLACK_BOX_MODELS = ["GPT5.2","gemini-3-pro-preview", "gemini-3.1-pro-preview"]
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -34,7 +35,7 @@ def parse_args():
         "--model",
         nargs="+",
         type=str,
-        default=["Qwen2.5_72B", "gemini-3-pro-preview", "GPT5.2", "llama3v3chat-70B"],
+        default=["Qwen2.5_72B", "gemini-3.1-pro-preview", "GPT5.2", "llama3v3chat-70B"],
         help="HF model ID(s) or local path(s)",
     )
     parser.add_argument(
@@ -48,7 +49,8 @@ def parse_args():
         "--task",
         nargs="+",
         type=str,
-        default=["addition", "anagram", "locality", "science", "geometry", "logic_puzzles"],
+        default=["addition", "anagram", "locality", "science", "geometry", "logic_puzzles",
+                 "arithmetic", "algebra", "combinatory", "number_theory"],
         help=f"Implemented task(s): {', '.join(TARGET_DICT.keys())}",
     )
     parser.add_argument(
@@ -59,13 +61,13 @@ def parse_args():
     parser.add_argument(
         "--filter-only",
         action="store_true",
-        default=True,
+        default=False,
         help="If set, only apply filters to existing labelled data",
     )
     parser.add_argument(
         "--distribution",
         type=str,
-        help="Choose between IID or OOD",
+        help="Choose between IID/OOD/OOD-SAMPLED-{N}",
     )
     return parser.parse_args()
 
@@ -128,7 +130,7 @@ def extract_prompting_response_and_confidence(df, method, task, model):
 def extract_consistency_response_and_confidence(df,task,model):
 
     # Group responses with the same instance_id and sort from most repeated answer to less repeated
-    if model == "gemini-3-pro-preview" or model == "GPT5.2":
+    if model in BLACK_BOX_MODELS:
         result = df.groupby(["instance_id", "question", TARGET_DICT[task]]).apply(count_responses)
     else:  
         result = df.groupby(["instance_id", TARGET_DICT[task]]).apply(count_responses)
@@ -176,7 +178,7 @@ def read_raw(model, task, method):
         raw_data = load_jsonl(f"raw_results/{model}/{task}/{method}.jsonl")
         raw_data = pd.DataFrame(raw_data)
     else:
-        if model == "GPT5.2" or (model == "gemini-3-pro-preview" and method == "self_consistency"):
+        if model == "GPT5.2" or (model=="gemini-3-pro-preview" and method == "self_consistency"):
             raw_data = pd.read_csv(f"raw_results/{model}/{task}/{method}.csv")
         else:
             raw_data = pd.read_csv(f"raw_results/{model}/{task}/{method}.csv", delimiter=";")
@@ -191,18 +193,24 @@ def main():
     model_list = args.model
     if args.method[0] == "ASSESSOR":
         method_list = ASSESSOR_METHODS
+    elif args.method[0] == "BLACK_BOX":
+        method_list = BLACK_BOX_METHODS
+    elif args.method[0] == "WHITE_BOX":
+        method_list = WHITE_BOX_METHODS
     else:
         method_list = args.method
     task_list = args.task
 
     if args.distribution != "IID" and args.distribution != "OOD":
-        raise ValueError("Invalid distribution. Choose between IID or OOD.")
+        #Check if the distribution is OOD-SAMPLED-{N}
+        if not args.distribution.startswith("OOD-SAMPLED-") and not args.distribution.startswith("IID-SAMPLED-"):
+            raise ValueError("Invalid distribution. Choose between IID or OOD.")
 
     
     for model in model_list:
         for method in method_list:
 
-            if args.distribution == "OOD" and method not in ASSESSOR_METHODS:
+            if "OOD" in args.distribution and method not in ASSESSOR_METHODS:
                 print(f"Skipping {model} with {method} as it is not an assessor method and we are only processing OOD distribution.")
                 continue
             
@@ -211,28 +219,31 @@ def main():
                 continue
 
             for task in task_list:
+
+                print(f"Processing {model} with {method} for task {task} and distribution {args.distribution}...")
                 
                 try:
                     if not args.filter_only and not method in ASSESSOR_METHODS:
 
                         if task == "addition" or task == "geometry" or task == "science" or task == "logic_puzzles" or task == "locality" or task == "anagram":
-                            raise ValueError(f"{task} task has already been labelled and revised.")
+                            print(f"{task} task has already been labelled and revised. Skipping...")
+                            continue
                         
                         if task == "science":
 
-                            if method == "self_consistency" and (model == "GPT5.2" or model == "gemini-3-pro-preview"):
+                            if method == "self_consistency" and (model in BLACK_BOX_MODELS and model != "gemini-3.1-pro-preview"):
                                 raw_data = read_raw(model, "science", method)
                             else:
                                 obqa = read_raw(model, "openbookqa", method)
                                 obqa = obqa.rename(columns={"answerKey":"correct_option"})
-                                if model == "gemini-3-pro-preview" or model == "GPT5.2":
+                                if model in BLACK_BOX_MODELS:
                                     obqa = obqa[["instance_id","question", "response"]]
                                 elif method != "SAR" and method != "semantic_energy" and method != "self_consistency":
                                     obqa = obqa[["instance_id","prompt", "response"]]
                                 obqa["instance_id"] = obqa["instance_id"].apply(lambda x: f"obqa_{x}")
 
                                 gpqa = read_raw(model, "gpqa", method)
-                                if model == "gemini-3-pro-preview" or model == "GPT5.2":
+                                if model in BLACK_BOX_MODELS:
                                     gpqa = gpqa[["instance_id","question", "response"]]
                                 elif method != "SAR" and method != "semantic_energy" and method != "self_consistency":
                                     gpqa = gpqa[["instance_id","prompt", "response"]]
@@ -310,11 +321,17 @@ def main():
                             del labelled_data["outcome"]
                             df_aux = get_auxiliary_results(model, task, target=False)
                             labelled_data = labelled_data.merge(df_aux[["instance_id","outcome"]], on="instance_id", how="left")
-                            if method in ASSESSOR_ANSWERABILITY_RISK:
-                                labelled_data["confidence"] = labelled_data["assessor_prob_correct"] * 100 
-                            elif method in ASSESSOR_ERROR_RISK:
-                                labelled_data["confidence"] = (1 - labelled_data["prob_incorrect"]) * 100
-
+                            if method in ASSESSOR_KEXIN:
+                                labelled_data["confidence"] = labelled_data["assessor_prob_correct"] * 100 # op 1
+                            elif method in ASSESSOR_ALVARO:
+                                labelled_data["confidence"] = (1 - labelled_data["prob_incorrect"]) * 100 # op 2
+                            # labelled_data["confidence"] = (1 - labelled_data["prob_incorrect"]) * 100 # op 2
+                            # labelled_data["confidence"] = (1 - 0.7 * labelled_data["prob_incorrect"] - labelled_data["prob_avoidance"]) * 100 # op 3.1
+                            # labelled_data["confidence"] = (1 - 0.6 * labelled_data["prob_incorrect"] - labelled_data["prob_avoidance"]) * 100 # op 3.2 esta parece mejor
+                            # labelled_data["confidence"] = (1 - 0.5 * labelled_data["prob_incorrect"] - labelled_data["prob_avoidance"]) * 100 # op 3.3
+                            # labelled_data["confidence"] = (1 - 0.4 * labelled_data["prob_incorrect"] - labelled_data["prob_avoidance"]) * 100 # op 3.4
+                            # labelled_data["confidence"] = (1 - labelled_data["prob_incorrect"] - 0.7 * labelled_data["prob_avoidance"]) * 100 # op 4
+                            # labelled_data["confidence"] = 1 - labelled_data["prob_avoidance"] * 100  # op 5
                 
                 except FileNotFoundError as e:
                     print(e)
@@ -328,6 +345,7 @@ def main():
                     # Apply threshold
                     final_results =  apply_filters(labelled_data, task, method, model)
 
+                    # if method != "formatted":
                     save_csv(final_results, f"./confidence_results/{args.distribution}/{model}/{task}/{method}.csv", index=False)
                     
                     print(f"Results processed for {model}, estimation {method}, task {task}, distribution {args.distribution}.")
